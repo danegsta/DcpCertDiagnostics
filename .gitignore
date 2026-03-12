@@ -1,0 +1,35 @@
+## .NET / C#
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bld/
+
+## NuGet
+*.nupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+## Visual Studio
+.vs/
+*.rsuser
+*.csproj.user
+
+## Rider / JetBrains
+.idea/
+*.sln.iml
+
+## macOS
+.DS_Store
+
+## Diagnostic output files
+dcp-cert-diagnostic-*.txt
