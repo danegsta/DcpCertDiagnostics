@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.Authentication;
@@ -185,6 +186,8 @@ internal static class EnvironmentInfo
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             CollectWindowsTlsRegistrySettings(report);
+            CollectWindowsCertificateChainPolicySettings(report);
+            CollectWindowsIPv6Settings(report);
         }
     }
 
@@ -247,6 +250,196 @@ internal static class EnvironmentInfo
             {
                 // Registry key doesn't exist — OS defaults apply
             }
+        }
+    }
+
+    /// <summary>
+    /// Collects Windows registry settings that affect certificate chain building, revocation
+    /// checking, and root trust policy. These policies — often applied via Group Policy in
+    /// hardened enterprise environments — can cause X509Chain.Build() to fail or throw for
+    /// ephemeral self-signed certificates like those DCP generates.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void CollectWindowsCertificateChainPolicySettings(DiagnosticReport report)
+    {
+        report.WriteSubHeader("Certificate Chain Policy (Windows)");
+        report.WriteInfo("Group Policy and registry settings that affect certificate chain building and trust decisions.");
+        report.WriteInfo("Enterprise hardening policies here can prevent custom trust of DCP's ephemeral CA.");
+        report.WriteBlankLine();
+
+        // Root auto-update policy — if disabled, chain building can fail for any CA not
+        // manually installed, and also indicates a locked-down enterprise environment.
+        ReadRegistryDword(report,
+            @"SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot", "DisableRootAutoUpdate",
+            Microsoft.Win32.RegistryHive.LocalMachine, "Root Auto-Update (Policy)");
+
+        // Third-party root certificate auto-update flags
+        ReadRegistryDword(report,
+            @"SOFTWARE\Microsoft\SystemCertificates\AuthRoot\AutoUpdate", "DisableRootAutoUpdate",
+            Microsoft.Win32.RegistryHive.LocalMachine, "Root Auto-Update (System)");
+
+        // Certificate revocation checking — policy-level enforcement
+        // When enabled, forces CRL/OCSP checks that fail for ephemeral CAs with no revocation endpoints.
+        ReadRegistryDword(report,
+            @"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Internet Settings", "CertificateRevocation",
+            Microsoft.Win32.RegistryHive.LocalMachine, "Revocation Checking (Policy)");
+
+        ReadRegistryDword(report,
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings", "CertificateRevocation",
+            Microsoft.Win32.RegistryHive.CurrentUser, "Revocation Checking (User)");
+
+        // SChannel-level settings that affect chain/certificate validation
+        ReadRegistryDword(report,
+            @"SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL", "CertificateMappingMethods",
+            Microsoft.Win32.RegistryHive.LocalMachine, "SChannel CertificateMappingMethods");
+
+        ReadRegistryDword(report,
+            @"SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL", "EnableOcspStaplingForSni",
+            Microsoft.Win32.RegistryHive.LocalMachine, "SChannel OCSP Stapling for SNI");
+
+        // Issuer cache settings — small or disabled caches can affect chain building performance
+        ReadRegistryDword(report,
+            @"SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL", "IssuerCacheSize",
+            Microsoft.Win32.RegistryHive.LocalMachine, "SChannel IssuerCacheSize");
+
+        ReadRegistryDword(report,
+            @"SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL", "IssuerCacheTime",
+            Microsoft.Win32.RegistryHive.LocalMachine, "SChannel IssuerCacheTime");
+
+        // Strong key protection — can force additional validation on certificate keys
+        ReadRegistryDword(report,
+            @"SOFTWARE\Policies\Microsoft\Cryptography", "ForceKeyProtection",
+            Microsoft.Win32.RegistryHive.LocalMachine, "ForceKeyProtection (Policy)");
+
+        // Cipher suite policy (Group Policy override) — just flag whether it's set,
+        // don't dump the actual suite list (not privacy-sensitive, but very verbose).
+        try
+        {
+            using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64)
+                .OpenSubKey(@"SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002");
+            if (key != null)
+            {
+                var functions = key.GetValue("Functions");
+                report.WriteField("Cipher Suite Policy (GPO)", functions != null ? "(custom cipher suite order set)" : "(not set)");
+            }
+            else
+            {
+                report.WriteField("Cipher Suite Policy (GPO)", "(not set — OS defaults)");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("Cipher Suite Policy (GPO)", $"(unable to read: {ex.Message})");
+        }
+
+        // WinTrust Software Publishing state — controls certificate verification trust decisions
+        ReadRegistryDword(report,
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\WinTrust\Trust Providers\Software Publishing", "State",
+            Microsoft.Win32.RegistryHive.CurrentUser, "WinTrust Software Publishing State");
+
+        // 64-bit SchUseStrongCrypto (WOW6432Node) — may differ from the 32-bit value
+        // already reported, which matters for cross-architecture processes.
+        ReadRegistryDword(report,
+            @"SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319", "SchUseStrongCrypto",
+            Microsoft.Win32.RegistryHive.LocalMachine, "SchUseStrongCrypto (WOW64)");
+    }
+
+    /// <summary>
+    /// Collects IPv6 configuration settings. DCP binds to [::1] (IPv6 loopback) and
+    /// certificates use ::1 as an IP SAN. Partial IPv6 disablement or preference changes
+    /// can affect how SChannel resolves and matches IPv6 addresses in certificate SANs.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void CollectWindowsIPv6Settings(DiagnosticReport report)
+    {
+        report.WriteSubHeader("IPv6 Configuration");
+        report.WriteInfo("DCP binds to [::1] (IPv6 loopback). IPv6 configuration can affect address resolution");
+        report.WriteInfo("and how SChannel matches IPv6 addresses against certificate IP SANs.");
+        report.WriteBlankLine();
+
+        try
+        {
+            using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64)
+                .OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters");
+            if (key != null)
+            {
+                var disabledComponents = key.GetValue("DisabledComponents");
+                if (disabledComponents is int value)
+                {
+                    report.WriteField("IPv6 DisabledComponents", $"0x{value:X2} ({value})");
+
+                    // Decode the flags for readability
+                    if (value == 0)
+                    {
+                        report.WriteInfo("  All IPv6 components enabled (default)");
+                    }
+                    else
+                    {
+                        if ((value & 0x01) != 0) report.WriteInfo("  Tunnel interfaces disabled");
+                        if ((value & 0x10) != 0) report.WriteInfo("  Native IPv6 interfaces disabled");
+                        if ((value & 0x20) != 0) report.WriteInfo("  IPv4 preferred over IPv6");
+                        if (value == 0xFF) report.WriteInfo("  All IPv6 disabled except loopback");
+                    }
+                }
+                else
+                {
+                    report.WriteField("IPv6 DisabledComponents", disabledComponents?.ToString() ?? "(not set — all enabled)");
+                }
+            }
+            else
+            {
+                report.WriteField("IPv6 DisabledComponents", "(registry key not found — all enabled)");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("IPv6 DisabledComponents", $"(unable to read: {ex.Message})");
+        }
+
+        // Check if IPv6 loopback is resolvable (functional check)
+        try
+        {
+            var loopback = IPAddress.IPv6Loopback;
+            report.WriteField("IPv6 Loopback Address", loopback.ToString());
+            report.WriteField("IPv6 Loopback Available", Socket.OSSupportsIPv6.ToString());
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("IPv6 Loopback Check", $"(error: {ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// Reads a DWORD value from the Windows registry and writes it to the report.
+    /// Only captures the numeric value — no private data.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void ReadRegistryDword(
+        DiagnosticReport report,
+        string subKeyPath,
+        string valueName,
+        Microsoft.Win32.RegistryHive hive,
+        string displayName)
+    {
+        try
+        {
+            using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, Microsoft.Win32.RegistryView.Registry64);
+            using var key = baseKey.OpenSubKey(subKeyPath);
+            if (key != null)
+            {
+                var value = key.GetValue(valueName);
+                report.WriteField(displayName, value?.ToString() ?? "(not set)");
+            }
+            else
+            {
+                report.WriteField(displayName, "(not set)");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField(displayName, $"(unable to read: {ex.Message})");
         }
     }
 

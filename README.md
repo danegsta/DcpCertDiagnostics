@@ -41,6 +41,22 @@ The tool will:
 | `--output, -o <path>` | Custom path for the report file (default: `dcp-cert-diagnostic-<timestamp>.txt`) |
 | `--help, -h` | Show help |
 
+## Using a Preview DCP Build
+
+To run against the latest Aspire DCP preview instead of the stable release:
+
+```bash
+dotnet run -p:UsePreviewDcp=true
+```
+
+You can also specify an arbitrary version directly:
+
+```bash
+dotnet run -p:DcpVersion=13.2.0-preview.1.26162.13
+```
+
+The preview packages are restored from the `dotnet9` dev feed configured in `nuget.config`.
+
 ## Using a Custom DCP Binary
 
 If you have a locally-built DCP binary (e.g., from the repo's `bin/` directory):

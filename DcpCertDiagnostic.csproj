@@ -7,6 +7,15 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!-- DCP version selection: use 'dotnet build -p:UsePreviewDcp=true' to switch to preview,
+       or 'dotnet build -p:DcpVersion=x.y.z' to specify an exact version -->
+  <PropertyGroup>
+    <DcpVersionRelease>13.1.2</DcpVersionRelease>
+    <DcpVersionPreview>13.2.0-preview.1.26162.13</DcpVersionPreview>
+    <DcpVersion Condition="'$(DcpVersion)' == '' And '$(UsePreviewDcp)' == 'true'">$(DcpVersionPreview)</DcpVersion>
+    <DcpVersion Condition="'$(DcpVersion)' == ''">$(DcpVersionRelease)</DcpVersion>
+  </PropertyGroup>
+
   <!-- Determine the RID for the Aspire.Hosting.Orchestration package based on the build platform -->
   <PropertyGroup>
     <DcpRid Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">win-x64</DcpRid>
@@ -18,7 +27,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.Orchestration.$(DcpRid)" Version="13.1.2" />
+    <PackageReference Include="Aspire.Hosting.Orchestration.$(DcpRid)" Version="$(DcpVersion)" />
     <PackageReference Include="KubernetesClient" Version="19.0.2" />
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
   </ItemGroup>
