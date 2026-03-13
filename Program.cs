@@ -57,7 +57,10 @@ internal static class Program
             // Phase 1: Environment information
             EnvironmentInfo.Collect(report);
 
-            // Phase 2: Resolve DCP binary
+            // Phase 2: ASP.NET Core development certificate check
+            DevCertDiagnostic.Diagnose(report);
+
+            // Phase 3: Resolve DCP binary
             var dcpPath = await DcpProcessManager.ResolveDcpPathAsync(dcpPathOverride, report);
             if (dcpPath == null)
             {
@@ -67,7 +70,7 @@ internal static class Program
                 return 1;
             }
 
-            // Phase 3: Start DCP
+            // Phase 4: Start DCP
             await using var dcpManager = new DcpProcessManager();
             var started = await dcpManager.StartAsync(dcpPath, report, cts.Token);
             if (!started || dcpManager.KubeconfigPath == null)
@@ -78,7 +81,7 @@ internal static class Program
                 return 1;
             }
 
-            // Phase 4: Parse kubeconfig
+            // Phase 5: Parse kubeconfig
             var kubeconfig = KubeconfigParser.ParseAndDiagnose(dcpManager.KubeconfigPath, report);
             if (kubeconfig == null)
             {
@@ -89,17 +92,20 @@ internal static class Program
                 return 1;
             }
 
-            // Phase 5: Check proxy configuration for DCP server URL
+            // Phase 6: Check proxy configuration for DCP server URL
             EnvironmentInfo.CheckProxyForTarget(kubeconfig.ServerUrl, report);
 
-            // Phase 6: Certificate chain analysis (raw SslStream)
+            // Phase 7: Certificate chain analysis (raw SslStream)
             await CertificateAnalyzer.AnalyzeAsync(kubeconfig, report, cts.Token);
 
-            // Phase 7: KubernetesClient connection diagnostic
+            // Phase 8: KubernetesClient connection diagnostic
             await KubernetesClientDiagnostic.DiagnoseAsync(
                 kubeconfig, dcpManager.KubeconfigPath, report, cts.Token);
 
-            // Phase 8: Dump DCP process output for reference
+            // Phase 9: Collect SChannel event logs (after validation so events from Phases 7-8 are captured)
+            EnvironmentInfo.CollectSChannelEventLog(report);
+
+            // Phase 10: Dump DCP process output for reference
             dcpManager.DumpProcessOutput(report);
         }
         catch (OperationCanceledException)
