@@ -188,6 +188,8 @@ internal static class EnvironmentInfo
             CollectWindowsTlsRegistrySettings(report);
             CollectWindowsCertificateChainPolicySettings(report);
             CollectWindowsIPv6Settings(report);
+            CollectWindowsThirdPartyCertValidation(report);
+            CollectWindowsSChannelEventLog(report);
         }
     }
 
@@ -409,6 +411,179 @@ internal static class EnvironmentInfo
         {
             report.WriteField("IPv6 Loopback Check", $"(error: {ex.Message})");
         }
+    }
+
+    /// <summary>
+    /// Detects third-party software that can intercept or modify certificate validation.
+    /// Enterprise endpoint protection (Zscaler, CrowdStrike, etc.) often hooks into CryptoAPI
+    /// or SChannel via custom DLLs or GPO certificate policies. Only reports names and presence,
+    /// not configuration values.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void CollectWindowsThirdPartyCertValidation(DiagnosticReport report)
+    {
+        report.WriteSubHeader("Third-Party Certificate Validation (Windows)");
+        report.WriteInfo("Detects software that may intercept or modify certificate chain building.");
+        report.WriteBlankLine();
+
+        // Custom revocation providers — third-party DLLs registered for CRL/OCSP checking
+        try
+        {
+            using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64)
+                .OpenSubKey(@"SOFTWARE\Microsoft\Cryptography\OID\EncodingType 0\CertDllVerifyRevocation");
+            if (key != null)
+            {
+                var subKeyNames = key.GetSubKeyNames();
+                if (subKeyNames.Length > 0)
+                {
+                    report.WriteWarn($"Custom Revocation Providers: {subKeyNames.Length} registered");
+                    foreach (var name in subKeyNames.Take(10))
+                    {
+                        report.WriteField("  Provider OID", name);
+                    }
+                }
+                else
+                {
+                    report.WriteField("Custom Revocation Providers", "(none)");
+                }
+            }
+            else
+            {
+                report.WriteField("Custom Revocation Providers", "(registry key not found)");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("Custom Revocation Providers", $"(unable to read: {ex.Message})");
+        }
+
+        // GPO certificate policy stores — indicates enterprise certificate management
+        try
+        {
+            using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64)
+                .OpenSubKey(@"SOFTWARE\Policies\Microsoft\SystemCertificates");
+            if (key != null)
+            {
+                var subKeyNames = key.GetSubKeyNames();
+                report.WriteField("GPO Certificate Stores", subKeyNames.Length > 0
+                    ? string.Join(", ", subKeyNames)
+                    : "(none)");
+            }
+            else
+            {
+                report.WriteField("GPO Certificate Stores", "(not configured)");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("GPO Certificate Stores", $"(unable to read: {ex.Message})");
+        }
+
+        // Enterprise root certificate pinning (EKU restrictions)
+        try
+        {
+            using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64)
+                .OpenSubKey(@"SOFTWARE\Policies\Microsoft\SystemCertificates\Root\Certificates");
+            if (key != null)
+            {
+                var pinnedRoots = key.GetSubKeyNames();
+                report.WriteField("GPO Pinned Root Certs", pinnedRoots.Length.ToString());
+            }
+            else
+            {
+                report.WriteField("GPO Pinned Root Certs", "(not configured)");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("GPO Pinned Root Certs", $"(unable to read: {ex.Message})");
+        }
+
+        // Custom authentication packages — third-party LSA plugins
+        try
+        {
+            using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64)
+                .OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Lsa");
+            if (key != null)
+            {
+                var packages = key.GetValue("Authentication Packages") as string[];
+                if (packages != null)
+                {
+                    // Only report non-default packages (msv1_0 is the Windows default)
+                    var nonDefault = packages.Where(p => !string.Equals(p, "msv1_0", StringComparison.OrdinalIgnoreCase)).ToArray();
+                    if (nonDefault.Length > 0)
+                    {
+                        report.WriteWarn($"Non-default Authentication Packages: {string.Join(", ", nonDefault)}");
+                    }
+                    else
+                    {
+                        report.WriteField("Authentication Packages", "(default only)");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("Authentication Packages", $"(unable to read: {ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// Captures recent SChannel event log entries from the Windows System log.
+    /// SChannel logs detailed TLS/SSL errors (Event IDs 36882, 36887, 36888) that .NET
+    /// wraps as generic CryptographicException. These events often contain the actual
+    /// OS-level error code needed for diagnosis.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void CollectWindowsSChannelEventLog(DiagnosticReport report)
+    {
+        report.WriteSubHeader("Recent SChannel Event Log Entries");
+        report.WriteInfo("SChannel errors are logged to the Windows System event log with detailed error codes.");
+        report.WriteInfo("Entries from the last hour are shown (if any).");
+        report.WriteBlankLine();
+
+        try
+        {
+            using var eventLog = new System.Diagnostics.EventLog("System");
+            var cutoff = DateTime.UtcNow.AddHours(-1);
+            var schannelEvents = eventLog.Entries
+                .Cast<System.Diagnostics.EventLogEntry>()
+                .Where(e => e.Source.Equals("Schannel", StringComparison.OrdinalIgnoreCase)
+                         && e.TimeGenerated.ToUniversalTime() >= cutoff)
+                .OrderByDescending(e => e.TimeGenerated)
+                .Take(10)
+                .ToList();
+
+            if (schannelEvents.Count == 0)
+            {
+                report.WriteField("SChannel Events (last hour)", "(none)");
+            }
+            else
+            {
+                report.WriteField("SChannel Events (last hour)", schannelEvents.Count.ToString());
+                foreach (var entry in schannelEvents)
+                {
+                    report.WriteField($"  Event {entry.InstanceId}",
+                        $"[{entry.EntryType}] {entry.TimeGenerated:HH:mm:ss} — {Truncate(entry.Message, 200)}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField("SChannel Event Log", $"(unable to read: {ex.Message})");
+        }
+    }
+
+    private static string Truncate(string value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value)) return "(empty)";
+        // Normalize newlines to spaces for single-line display
+        value = value.Replace("\r\n", " ").Replace("\n", " ");
+        return value.Length <= maxLength ? value : string.Concat(value.AsSpan(0, maxLength), "...");
     }
 
     /// <summary>

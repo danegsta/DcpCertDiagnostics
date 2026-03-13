@@ -107,6 +107,22 @@ internal static class CertificateAnalyzer
                 return true;
             };
 
+            // Log the exact targetHost value — critical for diagnosing NameMismatch.
+            // SChannel matches this against the cert's SANs; format differences
+            // (e.g., [::1] vs ::1 vs 0:0:0:0:0:0:0:1) can cause mismatches on hardened machines.
+            report.WriteBlankLine();
+            report.WriteSubHeader("SslStream Target Host");
+            report.WriteField("TargetHost Value", $"'{kubeconfig.Host}'");
+            if (IPAddress.TryParse(kubeconfig.Host, out var targetIp))
+            {
+                report.WriteField("TargetHost Type", $"IP Address ({targetIp.AddressFamily})");
+                report.WriteField("TargetHost Normalized", targetIp.ToString());
+            }
+            else
+            {
+                report.WriteField("TargetHost Type", "Hostname (DNS)");
+            }
+
             using var sslStream = new SslStream(
                 tcpClient.GetStream(),
                 leaveInnerStreamOpen: false,
@@ -270,6 +286,12 @@ internal static class CertificateAnalyzer
         report.WriteInfo("Mirrors KubernetesClient CertificateValidationCallBack: Build(serverCert) && Build(caCert)");
         report.WriteBlankLine();
         RunKubernetesClientEquivalentValidation(serverCert, kubeconfig.CaCertificate, report);
+
+        // SAN match probe — test whether the cert matches different hostname formats
+        AnalyzeSanMatching(serverCert, kubeconfig, report);
+
+        // Additional chain building modes to isolate the cause of failures
+        AnalyzeChainBuildingFallbackModes(serverCert, kubeconfig.CaCertificate, report);
     }
 
     /// <summary>
@@ -299,6 +321,7 @@ internal static class CertificateAnalyzer
             catch (Exception ex)
             {
                 report.WriteError($"[{label}] Step 1 chain.Build(serverCert) threw: {ex.Message}");
+                WriteChainBuildExceptionDetail(ex, chain, report, $"{label} Step1");
                 return;
             }
 
@@ -306,6 +329,8 @@ internal static class CertificateAnalyzer
             step1Chain = string.Join(" → ",
                 Enumerable.Range(0, chain.ChainElements.Count)
                     .Select(i => chain.ChainElements[i].Certificate.Subject));
+
+            WritePerElementChainStatus(chain, report, $"{label} Step1");
         }
 
         // Step 2: Build chain for each CA cert (KubernetesClient iterates all certs in the collection)
@@ -325,6 +350,7 @@ internal static class CertificateAnalyzer
             catch (Exception ex)
             {
                 report.WriteError($"[{label}] Step 2 chain.Build(caCert) threw: {ex.Message}");
+                WriteChainBuildExceptionDetail(ex, chain, report, $"{label} Step2");
                 return;
             }
 
@@ -332,6 +358,8 @@ internal static class CertificateAnalyzer
             step2Chain = string.Join(" → ",
                 Enumerable.Range(0, chain.ChainElements.Count)
                     .Select(i => chain.ChainElements[i].Certificate.Subject));
+
+            WritePerElementChainStatus(chain, report, $"{label} Step2");
         }
 
         // --- Diagnostic data ---
@@ -361,6 +389,210 @@ internal static class CertificateAnalyzer
         else
         {
             report.WriteFail($"[{label}] KubernetesClient would REJECT (isValid={isValid}, isTrusted={isTrusted})");
+        }
+    }
+
+    /// <summary>
+    /// Captures detailed exception information when X509Chain.Build() throws, including
+    /// HResult, inner exception chain, and any partial chain state.
+    /// </summary>
+    private static void WriteChainBuildExceptionDetail(
+        Exception ex, X509Chain chain, DiagnosticReport report, string label)
+    {
+        report.WriteField($"    [{label}] Exception Type", ex.GetType().FullName ?? ex.GetType().Name);
+        report.WriteField($"    [{label}] HResult", $"0x{ex.HResult:X8} ({ex.HResult})");
+
+        // Capture partial chain state — may be populated even after a throw
+        if (chain.ChainStatus.Length > 0)
+        {
+            foreach (var status in chain.ChainStatus)
+            {
+                report.WriteField($"    [{label}] Post-throw Status", $"{status.Status}: {status.StatusInformation}");
+            }
+        }
+        report.WriteField($"    [{label}] Chain Elements Built", chain.ChainElements.Count.ToString());
+
+        // Inner exception chain — captures OS-level error details
+        var inner = ex.InnerException;
+        int depth = 0;
+        while (inner != null && depth < 5)
+        {
+            report.WriteField($"    [{label}] InnerException[{depth}]",
+                $"{inner.GetType().Name}: {inner.Message} (HResult: 0x{inner.HResult:X8})");
+            inner = inner.InnerException;
+            depth++;
+        }
+    }
+
+    /// <summary>
+    /// Reports chain status for each individual chain element, showing which specific
+    /// certificate in the chain caused each status flag.
+    /// </summary>
+    private static void WritePerElementChainStatus(X509Chain chain, DiagnosticReport report, string label)
+    {
+        if (chain.ChainElements.Count == 0) return;
+
+        bool hasAnyElementStatus = false;
+        for (int i = 0; i < chain.ChainElements.Count; i++)
+        {
+            var element = chain.ChainElements[i];
+            if (element.ChainElementStatus.Length > 0)
+            {
+                hasAnyElementStatus = true;
+                foreach (var status in element.ChainElementStatus)
+                {
+                    report.WriteField($"    [{label}] Element[{i}] ({element.Certificate.Subject})",
+                        $"{status.Status}: {status.StatusInformation}");
+                }
+            }
+        }
+
+        if (!hasAnyElementStatus)
+        {
+            report.WriteField($"    [{label}] Per-element Status", "(no per-element errors)");
+        }
+    }
+
+    /// <summary>
+    /// Tests hostname matching against the server certificate using multiple IPv6 format variants.
+    /// Uses .NET's built-in MatchesHostname() which is platform-neutral, independent from
+    /// SChannel's hostname validation. Differences between these results and the SslStream
+    /// callback's NameMismatch flag indicate an OS-level SChannel issue.
+    /// </summary>
+    private static void AnalyzeSanMatching(
+        X509Certificate2 serverCert,
+        KubeconfigData kubeconfig,
+        DiagnosticReport report)
+    {
+        report.WriteBlankLine();
+        report.WriteSubHeader("SAN Hostname Match Probe");
+        report.WriteInfo("Tests server cert against multiple hostname formats using .NET's MatchesHostname().");
+        report.WriteInfo("Differences from SslStream's NameMismatch flag indicate OS-level SChannel behavior.");
+        report.WriteBlankLine();
+
+        // Build list of hostname variants to test
+        var hostnameVariants = new List<(string name, string value)>
+        {
+            ("Kubeconfig Host (actual)", kubeconfig.Host),
+        };
+
+        if (IPAddress.TryParse(kubeconfig.Host, out var ip))
+        {
+            // Add format variants for IP addresses
+            var normalized = ip.ToString();
+            if (normalized != kubeconfig.Host)
+            {
+                hostnameVariants.Add(("Normalized IP", normalized));
+            }
+
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                hostnameVariants.Add(("Bracketed IPv6", $"[{ip}]"));
+                hostnameVariants.Add(("Expanded IPv6", ExpandIPv6(ip)));
+
+                // Also test IPv4-mapped form if applicable
+                if (ip.IsIPv4MappedToIPv6)
+                {
+                    hostnameVariants.Add(("IPv4-mapped", ip.MapToIPv4().ToString()));
+                }
+            }
+        }
+
+        foreach (var (name, hostname) in hostnameVariants)
+        {
+            try
+            {
+                bool matches = serverCert.MatchesHostname(hostname, allowWildcards: false, allowCommonName: true);
+                if (matches)
+                {
+                    report.WritePass($"{name}: '{hostname}' → MATCH");
+                }
+                else
+                {
+                    report.WriteFail($"{name}: '{hostname}' → NO MATCH");
+                }
+            }
+            catch (Exception ex)
+            {
+                report.WriteField($"{name}: '{hostname}'", $"Error: {ex.Message}");
+            }
+        }
+    }
+
+    private static string ExpandIPv6(IPAddress ip)
+    {
+        var bytes = ip.GetAddressBytes();
+        var groups = new string[8];
+        for (int i = 0; i < 8; i++)
+        {
+            groups[i] = ((bytes[i * 2] << 8) | bytes[i * 2 + 1]).ToString("x4");
+        }
+        return string.Join(":", groups);
+    }
+
+    /// <summary>
+    /// Tests chain building with alternative trust and revocation modes to isolate the cause
+    /// of failures seen under CustomRootTrust. Comparing results across modes reveals whether
+    /// the issue is specific to custom trust, revocation policy, or the chain engine itself.
+    /// </summary>
+    private static void AnalyzeChainBuildingFallbackModes(
+        X509Certificate2 serverCert,
+        X509Certificate2 caCert,
+        DiagnosticReport report)
+    {
+        report.WriteBlankLine();
+        report.WriteSubHeader("Chain Building Fallback Modes");
+        report.WriteInfo("Tests chain building with alternative trust/revocation modes to isolate failures.");
+        report.WriteBlankLine();
+
+        // Mode 1: System trust with NoCheck — if this also throws, the chain engine is broadly broken
+        TryChainBuild(report, "SystemTrust+NoCheck", serverCert, chain =>
+        {
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.System;
+        });
+
+        // Mode 2: Custom trust with Offline revocation — tests if revocation policy enforcement causes the throw
+        TryChainBuild(report, "CustomTrust+OfflineRevocation", serverCert, chain =>
+        {
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.Offline;
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.CustomTrustStore.Add(caCert);
+        });
+
+        // Mode 3: Custom trust with VerificationFlags that ignore common enterprise policy issues
+        TryChainBuild(report, "CustomTrust+AllowUnknownCA", serverCert, chain =>
+        {
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.CustomTrustStore.Add(caCert);
+            chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+        });
+    }
+
+    private static void TryChainBuild(
+        DiagnosticReport report,
+        string modeName,
+        X509Certificate2 cert,
+        Action<X509Chain> configureChain)
+    {
+        using var chain = new X509Chain();
+        configureChain(chain);
+
+        try
+        {
+            bool result = chain.Build(cert);
+            report.WriteField($"  [{modeName}] Build()", result.ToString());
+            foreach (var status in chain.ChainStatus)
+            {
+                report.WriteField($"    Status", $"{status.Status}: {status.StatusInformation}");
+            }
+        }
+        catch (Exception ex)
+        {
+            report.WriteField($"  [{modeName}] Build()", $"THREW: {ex.Message}");
+            report.WriteField($"    HResult", $"0x{ex.HResult:X8}");
+            report.WriteField($"    Elements Built", chain.ChainElements.Count.ToString());
         }
     }
 

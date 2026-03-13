@@ -29,6 +29,7 @@
   <ItemGroup>
     <PackageReference Include="Aspire.Hosting.Orchestration.$(DcpRid)" Version="$(DcpVersion)" />
     <PackageReference Include="KubernetesClient" Version="19.0.2" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.5" />
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
   </ItemGroup>
 
