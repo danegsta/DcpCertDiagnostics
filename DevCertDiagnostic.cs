@@ -15,7 +15,11 @@ internal static class DevCertDiagnostic
     /// </summary>
     private const string AspNetHttpsOid = "1.3.6.1.4.1.311.84.1.1";
 
-    public static void Diagnose(DiagnosticReport report)
+    /// <summary>
+    /// Diagnoses ASP.NET Core dev certificates and returns the thumbprint of the best
+    /// valid and trusted certificate (if any), for use with DCP --tls-cert-thumbprint.
+    /// </summary>
+    public static string? Diagnose(DiagnosticReport report)
     {
         report.WriteHeader("ASP.NET Core Development Certificate");
 
@@ -27,18 +31,20 @@ internal static class DevCertDiagnostic
         catch (Exception ex)
         {
             report.WriteWarn($"Unable to search for dev certificates: {ex.Message}");
-            return;
+            return null;
         }
 
         if (devCerts.Count == 0)
         {
             report.WriteInfo("No ASP.NET Core HTTPS development certificate found in the CurrentUser/My store.");
             report.WriteInfo("This is expected if you have not run 'dotnet dev-certs https' or are not using dev certs.");
-            return;
+            return null;
         }
 
         report.WriteField("Dev Certificates Found", devCerts.Count.ToString());
         report.WriteBlankLine();
+
+        string? bestThumbprint = null;
 
         for (int i = 0; i < devCerts.Count; i++)
         {
@@ -52,11 +58,25 @@ internal static class DevCertDiagnostic
             CheckExpiration(cert, report);
             CheckChainBuild(cert, report);
 
+            // Pick the first valid, non-expired cert as the best candidate
+            if (bestThumbprint == null && IsValidAndCurrent(cert))
+            {
+                bestThumbprint = cert.Thumbprint;
+            }
+
             if (i < devCerts.Count - 1)
             {
                 report.WriteBlankLine();
             }
         }
+
+        return bestThumbprint;
+    }
+
+    private static bool IsValidAndCurrent(X509Certificate2 cert)
+    {
+        var now = DateTime.UtcNow;
+        return now >= cert.NotBefore.ToUniversalTime() && now <= cert.NotAfter.ToUniversalTime();
     }
 
     private static X509Certificate2Collection FindDevCertificates()

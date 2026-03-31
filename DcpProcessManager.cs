@@ -23,7 +23,7 @@ internal sealed class DcpProcessManager : IAsyncDisposable
     /// Resolves the DCP binary path. Uses the provided override path, or falls back to the
     /// path embedded in the assembly metadata from the Aspire.Hosting.Orchestration NuGet package.
     /// </summary>
-    public static async Task<string?> ResolveDcpPathAsync(string? overridePath, DiagnosticReport report)
+    public static async Task<(string? Path, string? Version)> ResolveDcpPathAsync(string? overridePath, DiagnosticReport report)
     {
         report.WriteHeader("DCP Binary Resolution");
 
@@ -35,13 +35,13 @@ internal sealed class DcpProcessManager : IAsyncDisposable
             if (File.Exists(overridePath))
             {
                 report.WriteInfo("DCP binary found at override path");
-                await LogBinaryInfoAsync(overridePath, report);
-                return overridePath;
+                var version = await LogBinaryInfoAsync(overridePath, report);
+                return (overridePath, version);
             }
             else
             {
                 report.WriteError($"DCP binary not found at override path: {overridePath}");
-                return null;
+                return (null, null);
             }
         }
 
@@ -58,7 +58,7 @@ internal sealed class DcpProcessManager : IAsyncDisposable
             report.WriteError("DcpCliPath assembly metadata not found");
             report.WriteInfo("This usually means the Aspire.Hosting.Orchestration NuGet package did not set $(DcpCliPath)");
             report.WriteInfo("Try using --dcp-path to specify the DCP binary path directly");
-            return null;
+            return (null, null);
         }
 
         report.WriteField("Path (from metadata)", dcpCliPath);
@@ -66,23 +66,26 @@ internal sealed class DcpProcessManager : IAsyncDisposable
         if (File.Exists(dcpCliPath))
         {
             report.WriteInfo("DCP binary found at NuGet package path");
-            await LogBinaryInfoAsync(dcpCliPath, report);
-            return dcpCliPath;
+            var version = await LogBinaryInfoAsync(dcpCliPath, report);
+            return (dcpCliPath, version);
         }
         else
         {
             report.WriteError($"DCP binary not found at NuGet package path: {dcpCliPath}");
             report.WriteInfo("The NuGet package may not have been restored correctly, or the path may be stale");
-            return null;
+            return (null, null);
         }
     }
 
     /// <summary>
     /// Starts DCP in API server-only mode and waits for the kubeconfig to be generated.
+    /// When <paramref name="tlsCertThumbprint"/> is provided, DCP is started with
+    /// <c>--tls-cert-thumbprint</c> so it uses the specified certificate from
+    /// CurrentUser/My for TLS instead of generating an ephemeral one.
     /// </summary>
-    public async Task<bool> StartAsync(string dcpPath, DiagnosticReport report, CancellationToken cancellationToken)
+    public async Task<bool> StartAsync(string dcpPath, DiagnosticReport report, CancellationToken cancellationToken, string? tlsCertThumbprint = null)
     {
-        report.WriteHeader("DCP Process Startup");
+        report.WriteHeader(tlsCertThumbprint != null ? "DCP Process Startup (--tls-cert-thumbprint)" : "DCP Process Startup");
 
         // Create temp directory for kubeconfig
         var tempDir = Path.Combine(Path.GetTempPath(), $"dcp-cert-diag-{Guid.NewGuid():N}");
@@ -91,12 +94,18 @@ internal sealed class DcpProcessManager : IAsyncDisposable
 
         report.WriteField("Kubeconfig Path", _kubeconfigPath);
 
+        var arguments = $"start-apiserver --server-only --kubeconfig \"{_kubeconfigPath}\"";
+        if (!string.IsNullOrEmpty(tlsCertThumbprint))
+        {
+            arguments += $" --tls-cert-thumbprint {tlsCertThumbprint}";
+        }
+
         // Start DCP without DCP_SECURE_TOKEN so it generates a real bearer token
         // and writes it directly to the kubeconfig (matching non-Aspire usage).
         var startInfo = new ProcessStartInfo
         {
             FileName = dcpPath,
-            Arguments = $"start-apiserver --server-only --kubeconfig \"{_kubeconfigPath}\"",
+            Arguments = arguments,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -255,7 +264,7 @@ internal sealed class DcpProcessManager : IAsyncDisposable
         }
     }
 
-    private static async Task LogBinaryInfoAsync(string path, DiagnosticReport report)
+    private static async Task<string?> LogBinaryInfoAsync(string path, DiagnosticReport report)
     {
         try
         {
@@ -293,6 +302,7 @@ internal sealed class DcpProcessManager : IAsyncDisposable
                     if (!string.IsNullOrWhiteSpace(output))
                     {
                         report.WriteField("DCP Version", output.Trim());
+                        return output.Trim();
                     }
                 }
                 else
@@ -306,5 +316,7 @@ internal sealed class DcpProcessManager : IAsyncDisposable
         {
             report.WriteInfo("Could not determine DCP version");
         }
+
+        return null;
     }
 }

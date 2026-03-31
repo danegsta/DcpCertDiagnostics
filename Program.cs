@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace DcpCertDiagnostic;
 
 /// <summary>
@@ -58,10 +60,10 @@ internal static class Program
             EnvironmentInfo.Collect(report);
 
             // Phase 2: ASP.NET Core development certificate check
-            DevCertDiagnostic.Diagnose(report);
+            var devCertThumbprint = DevCertDiagnostic.Diagnose(report);
 
             // Phase 3: Resolve DCP binary
-            var dcpPath = await DcpProcessManager.ResolveDcpPathAsync(dcpPathOverride, report);
+            var (dcpPath, dcpVersion) = await DcpProcessManager.ResolveDcpPathAsync(dcpPathOverride, report);
             if (dcpPath == null)
             {
                 report.WriteBlankLine();
@@ -102,11 +104,11 @@ internal static class Program
             await KubernetesClientDiagnostic.DiagnoseAsync(
                 kubeconfig, dcpManager.KubeconfigPath, report, cts.Token);
 
-            // Phase 9: Collect SChannel event logs (after validation so events from Phases 7-8 are captured)
-            EnvironmentInfo.CollectSChannelEventLog(report);
-
-            // Phase 10: Dump DCP process output for reference
+            // Phase 9: Dump DCP process output for reference
             dcpManager.DumpProcessOutput(report);
+
+            // Phase 10: (Preview DCP, Windows-only) Test --tls-cert-thumbprint with dev cert
+            await TestTlsCertThumbprintAsync(dcpPath, dcpVersion, devCertThumbprint, report, cts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -151,5 +153,72 @@ internal static class Program
             The diagnostic report is written to both the console and a timestamped file in the
             current directory. Share the file for analysis.
             """);
+    }
+
+    /// <summary>
+    /// When the DCP binary comes from a preview NuGet package on Windows and a valid dev cert
+    /// was found, starts a second DCP instance using --tls-cert-thumbprint and verifies connectivity.
+    /// </summary>
+    private static async Task TestTlsCertThumbprintAsync(
+        string dcpPath, string? dcpVersion, string? devCertThumbprint, DiagnosticReport report, CancellationToken cancellationToken)
+    {
+        // The DCP binary path includes the NuGet package version (e.g. "13.3.0-preview.1.26180.2")
+        // when resolved from the Aspire.Hosting.Orchestration package.
+        bool isPreview = dcpPath.Contains("preview", StringComparison.OrdinalIgnoreCase);
+
+        if (!isPreview)
+        {
+            return;
+        }
+
+        report.WriteHeader("DCP --tls-cert-thumbprint Diagnostic (Preview)");
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            report.WriteInfo("Skipped: --tls-cert-thumbprint is only supported on Windows.");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(devCertThumbprint))
+        {
+            report.WriteWarn("Skipped: No valid ASP.NET Core dev certificate was found in Phase 2.");
+            report.WriteInfo("Run 'dotnet dev-certs https --trust' to create and trust a dev certificate, then re-run.");
+            return;
+        }
+
+        report.WriteField("Dev Cert Thumbprint", devCertThumbprint);
+        report.WriteInfo("Starting a second DCP instance with --tls-cert-thumbprint to verify it can use the dev certificate for TLS.");
+        report.WriteBlankLine();
+
+        await using var thumbprintDcp = new DcpProcessManager();
+        var started = await thumbprintDcp.StartAsync(dcpPath, report, cancellationToken, tlsCertThumbprint: devCertThumbprint);
+
+        if (!started || thumbprintDcp.KubeconfigPath == null)
+        {
+            report.WriteFail("DCP failed to start with --tls-cert-thumbprint. See output above.");
+            thumbprintDcp.DumpProcessOutput(report);
+            return;
+        }
+
+        report.WritePass("DCP started successfully with --tls-cert-thumbprint.");
+
+        // Parse the kubeconfig from this DCP instance
+        var kubeconfig = KubeconfigParser.ParseAndDiagnose(thumbprintDcp.KubeconfigPath, report);
+        if (kubeconfig == null)
+        {
+            report.WriteFail("Failed to parse kubeconfig from --tls-cert-thumbprint DCP instance.");
+            thumbprintDcp.DumpProcessOutput(report);
+            return;
+        }
+
+        // Run certificate chain analysis against this DCP instance
+        await CertificateAnalyzer.AnalyzeAsync(kubeconfig, report, cancellationToken);
+
+        // Run KubernetesClient connection diagnostic against this DCP instance
+        await KubernetesClientDiagnostic.DiagnoseAsync(
+            kubeconfig, thumbprintDcp.KubeconfigPath, report, cancellationToken);
+
+        // Dump process output from the thumbprint DCP instance
+        thumbprintDcp.DumpProcessOutput(report);
     }
 }
