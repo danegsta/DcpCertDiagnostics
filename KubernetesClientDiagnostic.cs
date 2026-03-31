@@ -1,4 +1,5 @@
 using System.Net.Security;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using k8s;
 
@@ -10,7 +11,10 @@ namespace DcpCertDiagnostic;
 /// </summary>
 internal static class KubernetesClientDiagnostic
 {
-    public static async Task DiagnoseAsync(KubeconfigData kubeconfig, string kubeconfigPath, DiagnosticReport report, CancellationToken cancellationToken)
+    public static async Task DiagnoseAsync(
+        KubeconfigData kubeconfig, string kubeconfigPath,
+        string dcpPath, string? devCertThumbprint,
+        DiagnosticReport report, CancellationToken cancellationToken)
     {
         report.WriteHeader("KubernetesClient Connection Diagnostic");
 
@@ -79,6 +83,9 @@ internal static class KubernetesClientDiagnostic
         report.WriteBlankLine();
 
         await TestWithSkipTlsVerify(kubeconfigPath, report, cancellationToken);
+
+        // Test 4: (Preview DCP, Windows-only) Connection using --tls-cert-thumbprint with dev cert
+        await TestWithTlsCertThumbprint(dcpPath, devCertThumbprint, report, cancellationToken);
     }
 
     private static async Task TestWithCustomCallback(
@@ -241,6 +248,87 @@ internal static class KubernetesClientDiagnostic
             report.WriteError("This indicates a network/connectivity issue, not a TLS trust issue");
             LogExceptionChain(ex, report);
         }
+    }
+
+    /// <summary>
+    /// Starts a second DCP instance with --tls-cert-thumbprint (using the ASP.NET dev cert)
+    /// and verifies KubernetesClient can connect. Only runs for preview DCP on Windows.
+    /// </summary>
+    private static async Task TestWithTlsCertThumbprint(
+        string dcpPath, string? devCertThumbprint,
+        DiagnosticReport report, CancellationToken cancellationToken)
+    {
+        bool isPreview = dcpPath.Contains("preview", StringComparison.OrdinalIgnoreCase);
+        if (!isPreview || !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        report.WriteBlankLine();
+        report.WriteSubHeader("Test 4: KubernetesClient with DCP --tls-cert-thumbprint (Preview)");
+        report.WriteInfo("Starts a second DCP instance using the ASP.NET dev certificate for TLS,");
+        report.WriteInfo("then runs the same connection tests as above against it.");
+        report.WriteBlankLine();
+
+        if (string.IsNullOrEmpty(devCertThumbprint))
+        {
+            report.WriteWarn("Skipped: No valid ASP.NET Core dev certificate found.");
+            report.WriteInfo("Run 'dotnet dev-certs https --trust' to create and trust a dev certificate, then re-run.");
+            return;
+        }
+
+        report.WriteField("Dev Cert Thumbprint", devCertThumbprint);
+
+        await using var thumbprintDcp = new DcpProcessManager();
+        var started = await thumbprintDcp.StartAsync(dcpPath, report, cancellationToken, tlsCertThumbprint: devCertThumbprint, quiet: true);
+
+        if (!started || thumbprintDcp.KubeconfigPath == null)
+        {
+            report.WriteFail("DCP failed to start with --tls-cert-thumbprint.");
+            thumbprintDcp.DumpProcessOutput(report);
+            return;
+        }
+
+        report.WriteInfo($"DCP started with --tls-cert-thumbprint (PID captured, kubeconfig ready)");
+
+        KubernetesClientConfiguration config;
+        try
+        {
+            config = KubernetesClientConfiguration.BuildConfigFromConfigFile(thumbprintDcp.KubeconfigPath);
+        }
+        catch (Exception ex)
+        {
+            report.WriteFail($"Failed to build KubernetesClientConfiguration: {ex.Message}");
+            thumbprintDcp.DumpProcessOutput(report);
+            return;
+        }
+
+        report.WriteField("Host", config.Host);
+        report.WriteField("SkipTlsVerify", config.SkipTlsVerify.ToString());
+        if (config.SslCaCerts != null)
+        {
+            foreach (var cert in config.SslCaCerts)
+            {
+                report.WriteField("CA Cert Subject", cert.Subject);
+                report.WriteField("CA Cert Thumbprint", cert.Thumbprint);
+            }
+        }
+
+        // Run the same three test methods against the thumbprint DCP instance
+        report.WriteBlankLine();
+        report.WriteInfo("--- Test 4a: Custom Validation Callback ---");
+        report.WriteBlankLine();
+        await TestWithCustomCallback(config, report, cancellationToken);
+
+        report.WriteBlankLine();
+        report.WriteInfo("--- Test 4b: Default Behavior ---");
+        report.WriteBlankLine();
+        await TestWithDefaultBehavior(thumbprintDcp.KubeconfigPath, report, cancellationToken);
+
+        report.WriteBlankLine();
+        report.WriteInfo("--- Test 4c: SkipTlsVerify ---");
+        report.WriteBlankLine();
+        await TestWithSkipTlsVerify(thumbprintDcp.KubeconfigPath, report, cancellationToken);
     }
 
     private static void LogExceptionChain(Exception ex, DiagnosticReport report)

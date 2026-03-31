@@ -83,9 +83,12 @@ internal sealed class DcpProcessManager : IAsyncDisposable
     /// <c>--tls-cert-thumbprint</c> so it uses the specified certificate from
     /// CurrentUser/My for TLS instead of generating an ephemeral one.
     /// </summary>
-    public async Task<bool> StartAsync(string dcpPath, DiagnosticReport report, CancellationToken cancellationToken, string? tlsCertThumbprint = null)
+    public async Task<bool> StartAsync(string dcpPath, DiagnosticReport report, CancellationToken cancellationToken, string? tlsCertThumbprint = null, bool quiet = false)
     {
-        report.WriteHeader(tlsCertThumbprint != null ? "DCP Process Startup (--tls-cert-thumbprint)" : "DCP Process Startup");
+        if (!quiet)
+        {
+            report.WriteHeader("DCP Process Startup");
+        }
 
         // Create temp directory for kubeconfig
         var tempDir = Path.Combine(Path.GetTempPath(), $"dcp-cert-diag-{Guid.NewGuid():N}");
