@@ -78,7 +78,7 @@ internal static class DevCertDiagnostic
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
             RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            return ExportDevCertificateFiles(certThumbprint, report);
+            return ExportDevCertificateFiles(certThumbprint);
         }
 
         report.WriteBlankLine();
@@ -88,13 +88,8 @@ internal static class DevCertDiagnostic
         return null;
     }
 
-    private static DcpTlsOptions? ExportDevCertificateFiles(string certThumbprint, DiagnosticReport report)
+    private static DcpTlsOptions? ExportDevCertificateFiles(string certThumbprint)
     {
-        report.WriteBlankLine();
-        report.WriteSubHeader("DCP TLS File Preparation for Dev Certificate");
-        report.WriteInfo("Exporting the ASP.NET Core dev certificate to temporary PEM files for DCP.");
-        report.WriteWarn("The temporary private key file is unencrypted and will be deleted when the tool exits.");
-
         string? tempDir = null;
 
         try
@@ -103,23 +98,17 @@ internal static class DevCertDiagnostic
             Directory.CreateDirectory(tempDir);
             RestrictUnixPermissions(
                 tempDir,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
-                report);
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            report.WriteFail($"Unable to create temporary directory for dev certificate export: {ex.Message}");
             return null;
         }
 
         var certFile = Path.Combine(tempDir, "aspnet-dev-cert.pem");
         var keyFile = Path.ChangeExtension(certFile, ".key");
 
-        report.WriteField("Certificate File", certFile);
-        report.WriteField("Private Key File", keyFile);
-
-        var exportResult = RunDotnetDevCertsPemExport(certFile, report);
-        if (!exportResult.Success)
+        if (!RunDotnetDevCertsPemExport(certFile))
         {
             CleanupTemporaryDirectory(tempDir);
             return null;
@@ -127,15 +116,12 @@ internal static class DevCertDiagnostic
 
         if (!File.Exists(certFile) || !File.Exists(keyFile))
         {
-            report.WriteFail("dotnet dev-certs did not create the expected PEM certificate/key file pair.");
-            report.WriteField("Certificate File Exists", File.Exists(certFile).ToString());
-            report.WriteField("Private Key File Exists", File.Exists(keyFile).ToString());
             CleanupTemporaryDirectory(tempDir);
             return null;
         }
 
-        RestrictUnixPermissions(certFile, UnixFileMode.UserRead | UnixFileMode.UserWrite, report);
-        RestrictUnixPermissions(keyFile, UnixFileMode.UserRead | UnixFileMode.UserWrite, report);
+        RestrictUnixPermissions(certFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        RestrictUnixPermissions(keyFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
         return DcpTlsOptions.FromCertificateFiles(
             certFile,
@@ -352,7 +338,7 @@ internal static class DevCertDiagnostic
             : timestamp.ToUniversalTime().ToString("O");
     }
 
-    private static DevCertExportResult RunDotnetDevCertsPemExport(string certFile, DiagnosticReport report)
+    private static bool RunDotnetDevCertsPemExport(string certFile)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -370,15 +356,12 @@ internal static class DevCertDiagnostic
         startInfo.ArgumentList.Add("PEM");
         startInfo.ArgumentList.Add("--no-password");
 
-        report.WriteField("Export Command", FormatCommandForDisplay(startInfo));
-
         try
         {
             using var process = Process.Start(startInfo);
             if (process == null)
             {
-                report.WriteFail("Unable to start 'dotnet dev-certs' export process.");
-                return DevCertExportResult.Failed;
+                return false;
             }
 
             var stdoutTask = process.StandardOutput.ReadToEndAsync();
@@ -395,39 +378,21 @@ internal static class DevCertDiagnostic
                     // Process exited after the timeout check.
                 }
 
-                report.WriteFail("'dotnet dev-certs' PEM export timed out after 30 seconds.");
-                return DevCertExportResult.Failed;
+                return false;
             }
 
-            var stdout = stdoutTask.GetAwaiter().GetResult().Trim();
-            var stderr = stderrTask.GetAwaiter().GetResult().Trim();
+            _ = stdoutTask.GetAwaiter().GetResult();
+            _ = stderrTask.GetAwaiter().GetResult();
 
-            if (!string.IsNullOrWhiteSpace(stdout))
-            {
-                report.WriteField("dotnet dev-certs stdout", stdout);
-            }
-
-            if (!string.IsNullOrWhiteSpace(stderr))
-            {
-                report.WriteField("dotnet dev-certs stderr", stderr);
-            }
-
-            if (process.ExitCode != 0)
-            {
-                report.WriteFail($"'dotnet dev-certs' PEM export failed with exit code {process.ExitCode}.");
-                return DevCertExportResult.Failed;
-            }
-
-            return DevCertExportResult.Succeeded;
+            return process.ExitCode == 0;
         }
         catch (Exception ex) when (ex is InvalidOperationException or IOException or System.ComponentModel.Win32Exception)
         {
-            report.WriteFail($"Unable to run 'dotnet dev-certs' PEM export: {ex.Message}");
-            return DevCertExportResult.Failed;
+            return false;
         }
     }
 
-    private static void RestrictUnixPermissions(string path, UnixFileMode mode, DiagnosticReport report)
+    private static void RestrictUnixPermissions(string path, UnixFileMode mode)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -440,7 +405,6 @@ internal static class DevCertDiagnostic
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
         {
-            report.WriteWarn($"Unable to restrict permissions on '{path}': {ex.Message}");
         }
     }
 
@@ -498,16 +462,4 @@ internal static class DevCertDiagnostic
         public string? TrustLevel { get; set; }
     }
 
-    private sealed class DevCertExportResult
-    {
-        public static readonly DevCertExportResult Succeeded = new(true);
-        public static readonly DevCertExportResult Failed = new(false);
-
-        private DevCertExportResult(bool success)
-        {
-            Success = success;
-        }
-
-        public bool Success { get; }
-    }
 }
