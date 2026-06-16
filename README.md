@@ -31,7 +31,10 @@ The tool will:
 4. Check proxy configuration for the DCP server URL (proxies can cause TLS trust failures)
 5. Connect via raw `SslStream` to capture the full TLS handshake details
 6. Connect via `KubernetesClient` (same path as Aspire) with detailed logging
-7. Output a diagnostic report to both the console and a timestamped file
+7. Re-test `KubernetesClient` against DCP using the ASP.NET Core dev certificate
+   (`--tls-cert-thumbprint` on Windows; `--tls-cert-file`/`--tls-key-file` plus
+   `--tls-cert-thumbprint` for file verification on macOS/Linux)
+8. Output a diagnostic report to both the console and a timestamped file
 
 ## Options
 
@@ -70,6 +73,7 @@ dotnet run -- --dcp-path /path/to/dcp
 After running the tool, share the generated report file (e.g., `dcp-cert-diagnostic-20250101-120000.txt`). The report contains:
 
 - No secrets or tokens (bearer tokens are redacted to show only length)
+- No private keys (temporary dev certificate key files are deleted when the tool exits)
 - Certificate details (subjects, validity, extensions, SANs)
 - Chain validation results with all status codes
 - Exception details with stack traces

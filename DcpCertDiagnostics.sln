@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DcpCertDiagnostic", "DcpCertDiagnostic.csproj", "{6BDF7F57-2CD4-7F53-E623-249BC83ED025}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6BDF7F57-2CD4-7F53-E623-249BC83ED025}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6BDF7F57-2CD4-7F53-E623-249BC83ED025}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6BDF7F57-2CD4-7F53-E623-249BC83ED025}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6BDF7F57-2CD4-7F53-E623-249BC83ED025}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {A8E579FA-FCEB-4A41-B7E7-0DB1FEC63E2F}
+	EndGlobalSection
+EndGlobal

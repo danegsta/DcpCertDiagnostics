@@ -1,50 +1,38 @@
-using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text.Json;
 
 namespace DcpCertDiagnostic;
 
 /// <summary>
-/// Checks for the ASP.NET Core HTTPS development certificate and verifies
-/// that a certificate chain can be built for it (i.e., it is trusted).
+/// Checks for the ASP.NET Core HTTPS development certificate using
+/// <c>dotnet dev-certs</c> metadata.
 /// </summary>
 internal static class DevCertDiagnostic
 {
     /// <summary>
-    /// The well-known OID used by <c>dotnet dev-certs https</c> to mark the
-    /// ASP.NET Core HTTPS development certificate.
+    /// Diagnoses ASP.NET Core dev certificates and prepares platform-appropriate
+    /// DCP TLS options for dev certificate testing, if a current certificate exists.
     /// </summary>
-    private const string AspNetHttpsOid = "1.3.6.1.4.1.311.84.1.1";
-
-    /// <summary>
-    /// Diagnoses ASP.NET Core dev certificates and returns the thumbprint of the best
-    /// valid and trusted certificate (if any), for use with DCP --tls-cert-thumbprint.
-    /// </summary>
-    public static string? Diagnose(DiagnosticReport report)
+    public static DcpTlsOptions? Diagnose(DiagnosticReport report)
     {
         report.WriteHeader("ASP.NET Core Development Certificate");
 
-        X509Certificate2Collection devCerts;
-        try
+        var devCerts = GetDevCertMetadata(report);
+        if (devCerts == null)
         {
-            devCerts = FindDevCertificates();
-        }
-        catch (Exception ex)
-        {
-            report.WriteWarn($"Unable to search for dev certificates: {ex.Message}");
             return null;
         }
 
         if (devCerts.Count == 0)
         {
-            report.WriteInfo("No ASP.NET Core HTTPS development certificate found in the CurrentUser/My store.");
+            report.WriteInfo("No ASP.NET Core HTTPS development certificate found by 'dotnet dev-certs'.");
             report.WriteInfo("This is expected if you have not run 'dotnet dev-certs https' or are not using dev certs.");
             return null;
         }
 
         report.WriteField("Dev Certificates Found", devCerts.Count.ToString());
         report.WriteBlankLine();
-
-        string? bestThumbprint = null;
 
         for (int i = 0; i < devCerts.Count; i++)
         {
@@ -54,15 +42,7 @@ internal static class DevCertDiagnostic
                 report.WriteSubHeader($"Dev Certificate #{i + 1}");
             }
 
-            ReportCertDetails(cert, report);
-            CheckExpiration(cert, report);
-            CheckChainBuild(cert, report);
-
-            // Pick the first valid, non-expired cert as the best candidate
-            if (bestThumbprint == null && IsValidAndCurrent(cert))
-            {
-                bestThumbprint = cert.Thumbprint;
-            }
+            ReportCertMetadata(cert, report);
 
             if (i < devCerts.Count - 1)
             {
@@ -70,151 +50,464 @@ internal static class DevCertDiagnostic
             }
         }
 
-        return bestThumbprint;
-    }
-
-    private static bool IsValidAndCurrent(X509Certificate2 cert)
-    {
-        var now = DateTime.UtcNow;
-        return now >= cert.NotBefore.ToUniversalTime() && now <= cert.NotAfter.ToUniversalTime();
-    }
-
-    private static X509Certificate2Collection FindDevCertificates()
-    {
-        var results = new X509Certificate2Collection();
-
-        using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
-        store.Open(OpenFlags.ReadOnly);
-
-        foreach (var cert in store.Certificates)
+        var selectedCert = SelectDevCertificate(devCerts);
+        if (selectedCert?.Thumbprint == null)
         {
-            if (HasAspNetHttpsOid(cert))
-            {
-                results.Add(new X509Certificate2(cert));
-            }
+            report.WriteBlankLine();
+            report.WriteWarn("No current exportable ASP.NET Core dev certificate is available for DCP TLS testing.");
+            return null;
         }
 
-        return results;
+        if (devCerts.Count > 1)
+        {
+            report.WriteBlankLine();
+            report.WriteField("Selected Dev Cert Thumbprint", selectedCert.Thumbprint);
+            report.WriteField("Selected Trust Level", selectedCert.TrustLevel ?? "(not provided)");
+        }
+
+        return CreateDcpTlsOptions(selectedCert.Thumbprint, report);
     }
 
-    private static bool HasAspNetHttpsOid(X509Certificate2 cert)
+    private static DcpTlsOptions? CreateDcpTlsOptions(string certThumbprint, DiagnosticReport report)
     {
-        foreach (var ext in cert.Extensions)
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            if (ext.Oid?.Value == AspNetHttpsOid)
-            {
-                return true;
-            }
+            return DcpTlsOptions.FromThumbprint(certThumbprint);
         }
 
-        return false;
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
+            RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return ExportDevCertificateFiles(certThumbprint, report);
+        }
+
+        report.WriteBlankLine();
+        report.WriteSubHeader("DCP TLS Input for Dev Certificate");
+        report.WriteWarn("Skipped: DCP dev certificate TLS testing is only configured for Windows, macOS, and Linux.");
+
+        return null;
     }
 
-    private static void ReportCertDetails(X509Certificate2 cert, DiagnosticReport report)
+    private static DcpTlsOptions? ExportDevCertificateFiles(string certThumbprint, DiagnosticReport report)
     {
-        report.WriteField("Subject", cert.Subject);
-        report.WriteField("Issuer", cert.Issuer);
-        report.WriteField("Thumbprint", cert.Thumbprint);
-        report.WriteField("Not Before (UTC)", cert.NotBefore.ToUniversalTime().ToString("O"));
-        report.WriteField("Not After (UTC)", cert.NotAfter.ToUniversalTime().ToString("O"));
-        report.WriteField("Key Algorithm", $"{cert.PublicKey.Oid.FriendlyName} ({cert.PublicKey.GetRSAPublicKey()?.KeySize ?? cert.PublicKey.GetECDsaPublicKey()?.KeySize ?? 0}-bit)");
+        report.WriteBlankLine();
+        report.WriteSubHeader("DCP TLS File Preparation for Dev Certificate");
+        report.WriteInfo("Exporting the ASP.NET Core dev certificate to temporary PEM files for DCP.");
+        report.WriteWarn("The temporary private key file is unencrypted and will be deleted when the tool exits.");
 
-        var sanExt = cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().FirstOrDefault();
-        if (sanExt != null)
-        {
-            var dnsNames = sanExt.EnumerateDnsNames().ToList();
-            if (dnsNames.Count > 0)
-            {
-                report.WriteField("SAN DNS Names", string.Join(", ", dnsNames));
-            }
-        }
-    }
-
-    private static void CheckExpiration(X509Certificate2 cert, DiagnosticReport report)
-    {
-        report.WriteLabel("Expiration:");
-
-        var now = DateTime.UtcNow;
-
-        if (now < cert.NotBefore.ToUniversalTime())
-        {
-            report.WriteFail($"NOT YET VALID (NotBefore is {(cert.NotBefore.ToUniversalTime() - now).TotalMinutes:F1} minutes in the future)");
-        }
-        else if (now > cert.NotAfter.ToUniversalTime())
-        {
-            report.WriteFail($"EXPIRED ({(now - cert.NotAfter.ToUniversalTime()).TotalDays:F1} days ago)");
-        }
-        else
-        {
-            var remaining = cert.NotAfter.ToUniversalTime() - now;
-            if (remaining.TotalDays < 30)
-            {
-                report.WriteWarn($"Expiring soon ({remaining.TotalDays:F1} days remaining)");
-            }
-            else
-            {
-                report.WritePass($"Valid ({remaining.TotalDays:F0} days remaining)");
-            }
-        }
-    }
-
-    private static void CheckChainBuild(X509Certificate2 cert, DiagnosticReport report)
-    {
-        report.WriteLabel("Chain Build (System Trust):");
-
-        using var chain = new X509Chain();
-        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-        chain.ChainPolicy.TrustMode = X509ChainTrustMode.System;
+        string? tempDir = null;
 
         try
         {
-            bool result = chain.Build(cert);
+            tempDir = Path.Combine(Path.GetTempPath(), $"dcp-dev-cert-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            RestrictUnixPermissions(
+                tempDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                report);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            report.WriteFail($"Unable to create temporary directory for dev certificate export: {ex.Message}");
+            return null;
+        }
 
-            if (result)
+        var certFile = Path.Combine(tempDir, "aspnet-dev-cert.pem");
+        var keyFile = Path.ChangeExtension(certFile, ".key");
+
+        report.WriteField("Certificate File", certFile);
+        report.WriteField("Private Key File", keyFile);
+
+        var exportResult = RunDotnetDevCertsPemExport(certFile, report);
+        if (!exportResult.Success)
+        {
+            CleanupTemporaryDirectory(tempDir);
+            return null;
+        }
+
+        if (!File.Exists(certFile) || !File.Exists(keyFile))
+        {
+            report.WriteFail("dotnet dev-certs did not create the expected PEM certificate/key file pair.");
+            report.WriteField("Certificate File Exists", File.Exists(certFile).ToString());
+            report.WriteField("Private Key File Exists", File.Exists(keyFile).ToString());
+            CleanupTemporaryDirectory(tempDir);
+            return null;
+        }
+
+        RestrictUnixPermissions(certFile, UnixFileMode.UserRead | UnixFileMode.UserWrite, report);
+        RestrictUnixPermissions(keyFile, UnixFileMode.UserRead | UnixFileMode.UserWrite, report);
+
+        return DcpTlsOptions.FromCertificateFiles(
+            certFile,
+            keyFile,
+            certThumbprint,
+            temporaryDirectory: tempDir);
+    }
+
+    private static IReadOnlyList<DevCertMetadata>? GetDevCertMetadata(DiagnosticReport report)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("dev-certs");
+        startInfo.ArgumentList.Add("https");
+        startInfo.ArgumentList.Add("--check-trust-machine-readable");
+
+        report.WriteField("Check Command", FormatCommandForDisplay(startInfo));
+
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process == null)
             {
-                report.WritePass("Chain built successfully — dev certificate is trusted");
+                report.WriteFail("Unable to start 'dotnet dev-certs' check process.");
+                return null;
             }
-            else
-            {
-                report.WriteFail("Chain build failed — dev certificate is NOT trusted");
-                report.WriteInfo("Run 'dotnet dev-certs https --trust' to trust the dev certificate.");
 
-                foreach (var status in chain.ChainStatus)
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit(30_000))
+            {
+                try
                 {
-                    report.WriteField("  Chain Status", $"{status.Status}: {status.StatusInformation}");
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Process exited after the timeout check.
                 }
 
-                WritePerElementChainStatus(chain, report);
+                report.WriteFail("'dotnet dev-certs' trust check timed out after 30 seconds.");
+                return null;
             }
+
+            var stdout = stdoutTask.GetAwaiter().GetResult().Trim();
+            var stderr = stderrTask.GetAwaiter().GetResult().Trim();
+
+            if (!string.IsNullOrWhiteSpace(stderr))
+            {
+                report.WriteField("dotnet dev-certs stderr", stderr);
+            }
+
+            if (string.IsNullOrWhiteSpace(stdout))
+            {
+                if (process.ExitCode != 0)
+                {
+                    report.WriteWarn($"'dotnet dev-certs' trust check exited with code {process.ExitCode} and no JSON output.");
+                }
+
+                return Array.Empty<DevCertMetadata>();
+            }
+
+            IReadOnlyList<DevCertMetadata>? certificates;
+            try
+            {
+                certificates = JsonSerializer.Deserialize<List<DevCertMetadata>>(
+                    stdout,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            }
+            catch (JsonException ex)
+            {
+                report.WriteFail($"Unable to parse 'dotnet dev-certs' JSON output: {ex.Message}");
+                report.WriteField("dotnet dev-certs stdout", stdout);
+                return null;
+            }
+
+            if (process.ExitCode != 0)
+            {
+                report.WriteWarn($"'dotnet dev-certs' trust check exited with code {process.ExitCode}; using returned metadata for diagnostics.");
+            }
+
+            return certificates ?? Array.Empty<DevCertMetadata>();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or System.ComponentModel.Win32Exception)
         {
-            report.WriteFail($"Chain build threw an exception: {ex.Message}");
-            report.WriteField("  HResult", $"0x{ex.HResult:X8}");
-
-            if (chain.ChainElements.Count > 0)
-            {
-                report.WriteField("  Elements Built", chain.ChainElements.Count.ToString());
-                WritePerElementChainStatus(chain, report);
-            }
-
-            if (ex.InnerException != null)
-            {
-                report.WriteField("  Inner Exception", ex.InnerException.Message);
-            }
+            report.WriteFail($"Unable to run 'dotnet dev-certs' trust check: {ex.Message}");
+            return null;
         }
     }
 
-    private static void WritePerElementChainStatus(X509Chain chain, DiagnosticReport report)
+    private static void ReportCertMetadata(DevCertMetadata cert, DiagnosticReport report)
     {
-        for (int i = 0; i < chain.ChainElements.Count; i++)
+        report.WriteField("Subject", cert.Subject ?? "(not provided)");
+        report.WriteField("Thumbprint", cert.Thumbprint ?? "(not provided)");
+        report.WriteField("Not Before (UTC)", FormatTimestamp(cert.ValidityNotBefore));
+        report.WriteField("Not After (UTC)", FormatTimestamp(cert.ValidityNotAfter));
+        report.WriteField("Dev Cert Version", cert.Version.ToString());
+        report.WriteField("Is HTTPS Dev Cert", cert.IsHttpsDevelopmentCertificate.ToString());
+        report.WriteField("Is Exportable", cert.IsExportable.ToString());
+        report.WriteField("Trust Level", cert.TrustLevel ?? "(not provided)");
+
+        if (cert.X509SubjectAlternativeNameExtension is { Count: > 0 } sanNames)
         {
-            var element = chain.ChainElements[i];
-            foreach (var status in element.ChainElementStatus)
+            report.WriteField("SAN Names", string.Join(", ", sanNames));
+        }
+
+        report.WriteLabel("Validation:");
+
+        if (cert.IsHttpsDevelopmentCertificate)
+        {
+            report.WritePass("Certificate is marked as an ASP.NET Core HTTPS development certificate");
+        }
+        else
+        {
+            report.WriteFail("Certificate is not marked as an ASP.NET Core HTTPS development certificate");
+        }
+
+        if (cert.IsExportable)
+        {
+            report.WritePass("Certificate is exportable");
+        }
+        else
+        {
+            report.WriteFail("Certificate is not exportable");
+        }
+
+        if (IsCurrent(cert))
+        {
+            report.WritePass("Certificate is currently valid");
+        }
+        else
+        {
+            report.WriteFail("Certificate is expired or not yet valid");
+        }
+
+        switch (TrustRank(cert.TrustLevel))
+        {
+            case 3:
+                report.WritePass("Trust level is Full");
+                break;
+            case 2:
+                report.WriteWarn("Trust level is Partial");
+                break;
+            case 1:
+                report.WriteFail("Trust level is None");
+                break;
+            default:
+                report.WriteWarn("Trust level is unknown");
+                break;
+        }
+    }
+
+    private static DevCertMetadata? SelectDevCertificate(IEnumerable<DevCertMetadata> devCerts)
+    {
+        return devCerts
+            .Where(IsUsableForDcp)
+            .OrderByDescending(cert => TrustRank(cert.TrustLevel))
+            .ThenByDescending(cert => cert.Version)
+            .ThenByDescending(cert => cert.ValidityNotAfter)
+            .FirstOrDefault();
+    }
+
+    private static bool IsUsableForDcp(DevCertMetadata cert)
+    {
+        return cert.IsHttpsDevelopmentCertificate
+            && cert.IsExportable
+            && IsCurrent(cert)
+            && !string.IsNullOrWhiteSpace(cert.Thumbprint);
+    }
+
+    private static bool IsCurrent(DevCertMetadata cert)
+    {
+        if (cert.ValidityNotBefore == default || cert.ValidityNotAfter == default)
+        {
+            return false;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        return now >= cert.ValidityNotBefore.ToUniversalTime()
+            && now <= cert.ValidityNotAfter.ToUniversalTime();
+    }
+
+    private static int TrustRank(string? trustLevel)
+    {
+        if (string.Equals(trustLevel, "Full", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        if (string.Equals(trustLevel, "Partial", StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        if (string.Equals(trustLevel, "None", StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private static string FormatTimestamp(DateTimeOffset timestamp)
+    {
+        return timestamp == default
+            ? "(not provided)"
+            : timestamp.ToUniversalTime().ToString("O");
+    }
+
+    private static DevCertExportResult RunDotnetDevCertsPemExport(string certFile, DiagnosticReport report)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("dev-certs");
+        startInfo.ArgumentList.Add("https");
+        startInfo.ArgumentList.Add("--export-path");
+        startInfo.ArgumentList.Add(certFile);
+        startInfo.ArgumentList.Add("--format");
+        startInfo.ArgumentList.Add("PEM");
+        startInfo.ArgumentList.Add("--no-password");
+
+        report.WriteField("Export Command", FormatCommandForDisplay(startInfo));
+
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process == null)
             {
-                report.WriteField($"  Element[{i}] ({element.Certificate.Subject})",
-                    $"{status.Status}: {status.StatusInformation}");
+                report.WriteFail("Unable to start 'dotnet dev-certs' export process.");
+                return DevCertExportResult.Failed;
+            }
+
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit(30_000))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Process exited after the timeout check.
+                }
+
+                report.WriteFail("'dotnet dev-certs' PEM export timed out after 30 seconds.");
+                return DevCertExportResult.Failed;
+            }
+
+            var stdout = stdoutTask.GetAwaiter().GetResult().Trim();
+            var stderr = stderrTask.GetAwaiter().GetResult().Trim();
+
+            if (!string.IsNullOrWhiteSpace(stdout))
+            {
+                report.WriteField("dotnet dev-certs stdout", stdout);
+            }
+
+            if (!string.IsNullOrWhiteSpace(stderr))
+            {
+                report.WriteField("dotnet dev-certs stderr", stderr);
+            }
+
+            if (process.ExitCode != 0)
+            {
+                report.WriteFail($"'dotnet dev-certs' PEM export failed with exit code {process.ExitCode}.");
+                return DevCertExportResult.Failed;
+            }
+
+            return DevCertExportResult.Succeeded;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or System.ComponentModel.Win32Exception)
+        {
+            report.WriteFail($"Unable to run 'dotnet dev-certs' PEM export: {ex.Message}");
+            return DevCertExportResult.Failed;
+        }
+    }
+
+    private static void RestrictUnixPermissions(string path, UnixFileMode mode, DiagnosticReport report)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        try
+        {
+            File.SetUnixFileMode(path, mode);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            report.WriteWarn($"Unable to restrict permissions on '{path}': {ex.Message}");
+        }
+    }
+
+    private static string FormatCommandForDisplay(ProcessStartInfo startInfo)
+    {
+        return string.Join(" ", new[] { startInfo.FileName }
+            .Concat(startInfo.ArgumentList)
+            .Select(QuoteArgumentForDisplay));
+    }
+
+    private static string QuoteArgumentForDisplay(string argument)
+    {
+        if (argument.Length == 0)
+        {
+            return "\"\"";
+        }
+
+        return argument.Any(char.IsWhiteSpace) || argument.Contains('"')
+            ? $"\"{argument.Replace("\"", "\\\"")}\""
+            : argument;
+    }
+
+    private static void CleanupTemporaryDirectory(string temporaryDirectory)
+    {
+        try
+        {
+            if (Directory.Exists(temporaryDirectory))
+            {
+                Directory.Delete(temporaryDirectory, recursive: true);
             }
         }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private sealed class DevCertMetadata
+    {
+        public string? Thumbprint { get; set; }
+
+        public string? Subject { get; set; }
+
+        public IReadOnlyList<string>? X509SubjectAlternativeNameExtension { get; set; }
+
+        public int Version { get; set; }
+
+        public DateTimeOffset ValidityNotBefore { get; set; }
+
+        public DateTimeOffset ValidityNotAfter { get; set; }
+
+        public bool IsHttpsDevelopmentCertificate { get; set; }
+
+        public bool IsExportable { get; set; }
+
+        public string? TrustLevel { get; set; }
+    }
+
+    private sealed class DevCertExportResult
+    {
+        public static readonly DevCertExportResult Succeeded = new(true);
+        public static readonly DevCertExportResult Failed = new(false);
+
+        private DevCertExportResult(bool success)
+        {
+            Success = success;
+        }
+
+        public bool Success { get; }
     }
 }

@@ -79,11 +79,15 @@ internal sealed class DcpProcessManager : IAsyncDisposable
 
     /// <summary>
     /// Starts DCP in API server-only mode and waits for the kubeconfig to be generated.
-    /// When <paramref name="tlsCertThumbprint"/> is provided, DCP is started with
-    /// <c>--tls-cert-thumbprint</c> so it uses the specified certificate from
-    /// CurrentUser/My for TLS instead of generating an ephemeral one.
+    /// When <paramref name="tlsOptions"/> is provided, DCP is started with the
+    /// requested TLS certificate source instead of generating an ephemeral one.
     /// </summary>
-    public async Task<bool> StartAsync(string dcpPath, DiagnosticReport report, CancellationToken cancellationToken, string? tlsCertThumbprint = null, bool quiet = false)
+    public async Task<bool> StartAsync(
+        string dcpPath,
+        DiagnosticReport report,
+        CancellationToken cancellationToken,
+        DcpTlsOptions? tlsOptions = null,
+        bool quiet = false)
     {
         if (!quiet)
         {
@@ -97,25 +101,23 @@ internal sealed class DcpProcessManager : IAsyncDisposable
 
         report.WriteField("Kubeconfig Path", _kubeconfigPath);
 
-        var arguments = $"start-apiserver --server-only --kubeconfig \"{_kubeconfigPath}\"";
-        if (!string.IsNullOrEmpty(tlsCertThumbprint))
-        {
-            arguments += $" --tls-cert-thumbprint {tlsCertThumbprint}";
-        }
-
         // Start DCP without DCP_SECURE_TOKEN so it generates a real bearer token
         // and writes it directly to the kubeconfig (matching non-Aspire usage).
         var startInfo = new ProcessStartInfo
         {
             FileName = dcpPath,
-            Arguments = arguments,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
         };
+        startInfo.ArgumentList.Add("start-apiserver");
+        startInfo.ArgumentList.Add("--server-only");
+        startInfo.ArgumentList.Add("--kubeconfig");
+        startInfo.ArgumentList.Add(_kubeconfigPath);
+        tlsOptions?.AddTlsArguments(startInfo);
 
-        report.WriteField("Command", $"{startInfo.FileName} {startInfo.Arguments}");
+        report.WriteField("Command", FormatCommandForDisplay(startInfo));
         report.WriteInfo("Starting DCP process...");
 
         try
@@ -321,5 +323,24 @@ internal sealed class DcpProcessManager : IAsyncDisposable
         }
 
         return null;
+    }
+
+    private static string FormatCommandForDisplay(ProcessStartInfo startInfo)
+    {
+        return string.Join(" ", new[] { startInfo.FileName }
+            .Concat(startInfo.ArgumentList)
+            .Select(QuoteArgumentForDisplay));
+    }
+
+    private static string QuoteArgumentForDisplay(string argument)
+    {
+        if (argument.Length == 0)
+        {
+            return "\"\"";
+        }
+
+        return argument.Any(char.IsWhiteSpace) || argument.Contains('"')
+            ? $"\"{argument.Replace("\"", "\\\"")}\""
+            : argument;
     }
 }

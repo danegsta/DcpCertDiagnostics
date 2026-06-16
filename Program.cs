@@ -58,7 +58,7 @@ internal static class Program
             EnvironmentInfo.Collect(report);
 
             // Phase 2: ASP.NET Core development certificate check
-            var devCertThumbprint = DevCertDiagnostic.Diagnose(report);
+            using var devCertTlsOptions = DevCertDiagnostic.Diagnose(report);
 
             // Phase 3: Resolve DCP binary
             var (dcpPath, _) = await DcpProcessManager.ResolveDcpPathAsync(dcpPathOverride, report);
@@ -100,7 +100,7 @@ internal static class Program
 
             // Phase 8: KubernetesClient connection diagnostic
             await KubernetesClientDiagnostic.DiagnoseAsync(
-                kubeconfig, dcpManager.KubeconfigPath, dcpPath, devCertThumbprint, report, cts.Token);
+                kubeconfig, dcpManager.KubeconfigPath, dcpPath, devCertTlsOptions, report, cts.Token);
 
             // Phase 9: Dump DCP process output for reference
             dcpManager.DumpProcessOutput(report);
